@@ -808,25 +808,95 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
         })
     }
 
+    fn sock_connect(&self, ipv4_addr: u32, port: u16) -> Result<types::Fd> {
+        use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+        let addr = SocketAddrV4::new(Ipv4Addr::from(ipv4_addr), port);
+        let stream = TcpStream::connect(addr)?;
+        let handle: Box<dyn crate::handle::Handle> =
+            Box::new(SocketHandle(std::cell::RefCell::new(stream)));
+        let entry = Entry::new(EntryHandle::from(handle));
+        self.insert_entry(entry)
+    }
+
     fn sock_recv(
         &self,
-        _fd: types::Fd,
-        _ri_data: &types::IovecArray<'_>,
+        fd: types::Fd,
+        ri_data: &types::IovecArray<'_>,
         _ri_flags: types::Riflags,
     ) -> Result<(types::Size, types::Roflags)> {
-        unimplemented!("sock_recv")
+        use std::convert::TryFrom;
+        use std::io::IoSliceMut;
+        let mut bufs = Vec::with_capacity(ri_data.len() as usize);
+        for iov in ri_data.iter() {
+            let iov = iov?;
+            let iov: types::Iovec = iov.read()?;
+            let buf = iov.buf.as_array(iov.buf_len).as_slice()?;
+            bufs.push(buf);
+        }
+        let mut iovs: Vec<_> = bufs.iter_mut().map(|s| IoSliceMut::new(&mut *s)).collect();
+        let total_size = self
+            .get_entry(fd)?
+            .as_handle(&HandleRights::empty())?
+            .read_vectored(&mut iovs)?;
+        Ok((total_size as u32, types::Roflags::try_from(0)?))
     }
 
     fn sock_send(
         &self,
-        _fd: types::Fd,
-        _si_data: &types::CiovecArray<'_>,
+        fd: types::Fd,
+        si_data: &types::CiovecArray<'_>,
         _si_flags: types::Siflags,
     ) -> Result<types::Size> {
-        unimplemented!("sock_send")
+        use std::io::IoSlice;
+        let mut bufs = Vec::with_capacity(si_data.len() as usize);
+        for iov in si_data.iter() {
+            let iov = iov?;
+            let iov: types::Ciovec = iov.read()?;
+            let buf = iov.buf.as_array(iov.buf_len).as_slice()?;
+            bufs.push(buf);
+        }
+        let iovs: Vec<_> = bufs.iter().map(|s| IoSlice::new(&*s)).collect();
+        let total_size = self
+            .get_entry(fd)?
+            .as_handle(&HandleRights::empty())?
+            .write_vectored(&iovs)?;
+        eprintln!("sock_send {} bytes written", total_size);
+        Ok(total_size as u32)
     }
 
-    fn sock_shutdown(&self, _fd: types::Fd, _how: types::Sdflags) -> Result<()> {
+    fn sock_shutdown(&self, _: types::Fd, _: types::Sdflags) -> Result<()> {
         unimplemented!("sock_shutdown")
+    }
+}
+
+struct SocketHandle(std::cell::RefCell<std::net::TcpStream>);
+
+impl crate::handle::Handle for SocketHandle {
+    fn read_vectored(&self, iovs: &mut [io::IoSliceMut]) -> Result<usize> {
+        use std::io::Read;
+        Ok(self.0.borrow_mut().read_vectored(iovs)?)
+    }
+
+    fn write_vectored(&self, iovs: &[io::IoSlice]) -> Result<usize> {
+        use std::io::Write;
+        Ok(self.0.borrow_mut().write_vectored(iovs)?)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn try_clone(&self) -> io::Result<Box<dyn crate::Handle>> {
+        Ok(Box::new(SocketHandle(std::cell::RefCell::new(
+            self.0.borrow().try_clone()?,
+        ))))
+    }
+
+    fn get_file_type(&self) -> types::Filetype {
+        types::Filetype::SocketStream
+    }
+
+    fn set_rights(&self, _: HandleRights) {
+        // noop
     }
 }
